@@ -816,6 +816,16 @@ def print_and_save_timings(timings, outdir):
             print(f"    Rank {i}: {p:.2f} GB")
         print(f"    Average: {timings['gpu_mem_peak_avg_gb']:.2f} GB")
 
+    if "gpu_vram_peak_allocated_gib" in timings:
+        print("  [VRAM peak (this rank, see [Debug][VRAM] line)]")
+        print(
+            f"    max_memory_allocated: {timings['gpu_vram_peak_allocated_gib']:.2f} GiB"
+        )
+        if "gpu_vram_peak_reserved_gib" in timings:
+            print(
+                f"    max_memory_reserved:  {timings['gpu_vram_peak_reserved_gib']:.2f} GiB"
+            )
+
     print(f"{'='*72}\n")
 
     outdir = Path(outdir)

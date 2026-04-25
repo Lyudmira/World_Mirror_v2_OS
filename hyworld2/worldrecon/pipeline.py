@@ -239,12 +239,13 @@ class WorldMirrorPipeline:
     a unified API. Multi-GPU mode is auto-detected from torch.distributed.
     """
 
-    def __init__(self, model, device, sp_size=1, sp_group=None, rank=0):
+    def __init__(self, model, device, sp_size=1, sp_group=None, rank=0, enable_bf16: bool = False):
         self.model = model
         self.device = device
         self.sp_size = sp_size
         self.sp_group = sp_group
         self.rank = rank
+        self.enable_bf16 = bool(enable_bf16)
 
     @classmethod
     def from_pretrained(
@@ -381,7 +382,7 @@ class WorldMirrorPipeline:
                 alloc = torch.cuda.memory_allocated(device) / (1024**3)
                 print(f"[Memory] allocated={alloc:.2f}GB")
 
-        return cls(model, device, sp_size, sp_group, rank)
+        return cls(model, device, sp_size, sp_group, rank, enable_bf16=enable_bf16)
 
     @torch.no_grad()
     def __call__(
@@ -429,6 +430,7 @@ class WorldMirrorPipeline:
         # Misc
         log_time: bool = True,
         strict_output_path: str = None,
+        max_input_views: int = None,
     ) -> str:
         """Run inference on images/video and save results.
 
@@ -456,6 +458,19 @@ class WorldMirrorPipeline:
             video_strategy=video_strategy,
             min_frames=video_min_frames, max_frames=video_max_frames,
         )
+        n0 = len(img_paths)
+        if max_input_views is not None and n0 > int(max_input_views) and int(max_input_views) > 0:
+            idx = np.linspace(0, n0 - 1, int(max_input_views), dtype=int)
+            img_paths = [img_paths[i] for i in idx]
+            if rank == 0:
+                print(
+                    f"[Inference] Subsampled views: {n0} -> {len(img_paths)} (max_input_views={max_input_views})"
+                )
+        if self.sp_size > 1 and len(img_paths) < self.sp_size:
+            raise ValueError(
+                f"After subsampling, number of images ({len(img_paths)}) is still < sp_size "
+                f"({self.sp_size}). Increase max_input_views or use fewer GPUs."
+            )
         if log_time:
             timings["data_loading"] = time.perf_counter() - t0
 
@@ -566,6 +581,21 @@ class WorldMirrorPipeline:
                     except Exception as e:
                         print(f"[Pipeline] Warning: video rendering failed: {e}")
 
+            # Peak VRAM in this run (reset_peak_memory_stats was called immediately before
+            # _run_inference; window covers forward + mask + save + optional render on this process).
+            if torch.cuda.is_available() and self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
+                peak_alloc = torch.cuda.max_memory_allocated(self.device) / (1024**3)
+                peak_rsrv = torch.cuda.max_memory_reserved(self.device) / (1024**3)
+                if log_time:
+                    timings["gpu_vram_peak_allocated_gib"] = float(peak_alloc)
+                    timings["gpu_vram_peak_reserved_gib"] = float(peak_rsrv)
+                print(
+                    f"[Debug][VRAM] Peak this run (since reset before forward): "
+                    f"max_allocated={peak_alloc:.2f} GiB, max_reserved={peak_rsrv:.2f} GiB",
+                    flush=True,
+                )
+
             if not is_distributed:
                 del predictions
                 torch.cuda.empty_cache()
@@ -587,10 +617,17 @@ class WorldMirrorPipeline:
     def _run_inference(self, img_paths, target_size, prior_cam_path, prior_depth_path):
         """Run model forward pass."""
         device = self.device
-        imgs = prepare_images_to_tensor(
+        # Keep CPU tensor in float32 for PIL pipeline; on GPU, use bfloat16 when the model
+        # runs in bf16 to avoid an extra full fp32 copy of the image batch.
+        _img_t = prepare_images_to_tensor(
             img_paths, target_size=target_size, resize_strategy="crop"
-        ).to(device)
-        views = {"img": imgs}
+        )
+        if device.type == "cuda" and self.enable_bf16:
+            _img_t = _img_t.to(device=device, dtype=torch.bfloat16, non_blocking=True)
+        else:
+            _img_t = _img_t.to(device, non_blocking=device.type == "cuda")
+        views = {"img": _img_t}
+        imgs = _img_t
         B, S, C, H, W = imgs.shape
 
         if self.sp_size > 1 and S < self.sp_size:
@@ -620,12 +657,19 @@ class WorldMirrorPipeline:
         if prior_depth_path and os.path.isdir(prior_depth_path):
             depth = load_prior_depth(prior_depth_path, img_paths, H, W, preprocess_transform=pp_xform)
             if depth is not None:
-                views["depthmap"] = depth.to(device)
+                if device.type == "cuda" and self.enable_bf16:
+                    depth = depth.to(device=device, dtype=torch.bfloat16, non_blocking=True)
+                else:
+                    depth = depth.to(device, non_blocking=device.type == "cuda")
+                views["depthmap"] = depth
                 cond_flags[1] = 1
 
         use_amp = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
         inner = self.model.module if hasattr(self.model, 'module') else self.model
         model_bf16 = getattr(inner, 'enable_bf16', False)
+
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
         t0 = time.perf_counter()
         with torch.amp.autocast("cuda", enabled=(not model_bf16 and use_amp), dtype=torch.bfloat16):
@@ -738,6 +782,12 @@ def main():
     parser.add_argument("--compress_gs_max_points", type=int, default=5_000_000)
     parser.add_argument("--prior_cam_path", type=str, default=None)
     parser.add_argument("--prior_depth_path", type=str, default=None)
+    parser.add_argument(
+        "--max_input_views",
+        type=int,
+        default=None,
+        help="If set, evenly subsample to at most this many input images (reduces memory; changes multi-view context).",
+    )
     parser.add_argument("--disable_heads", type=str, nargs="*", default=None,
                         help="Heads to disable: camera depth normal points gs")
     parser.add_argument("--save_rendered", action="store_true", default=False,
@@ -794,6 +844,7 @@ def main():
         render_depth=args.render_depth,
         log_time=args.log_time,
         strict_output_path=args.strict_output_path,
+        max_input_views=args.max_input_views,
     )
 
     try:
