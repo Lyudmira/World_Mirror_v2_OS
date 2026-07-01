@@ -413,6 +413,8 @@ class WorldMirrorPipeline:
         confidence_percentile: float = 10.0,
         edge_normal_threshold: float = 1.0,
         edge_depth_threshold: float = 0.03,
+        border_sentinel_rgb: tuple = None,
+        border_sentinel_tol: float = 0.12,
         # Compression
         compress_pts: bool = True,
         compress_pts_max_points: int = 2_000_000,
@@ -508,7 +510,7 @@ class WorldMirrorPipeline:
             ) if apply_sky_mask else None)
 
             filter_mask, gs_filter_mask = None, None
-            if apply_confidence_mask or apply_edge_mask or apply_sky_mask:
+            if apply_confidence_mask or apply_edge_mask or apply_sky_mask or border_sentinel_rgb is not None:
                 filter_mask, gs_filter_mask = compute_filter_mask(
                     predictions, imgs, img_paths, H, W, S,
                     apply_confidence_mask=apply_confidence_mask,
@@ -518,6 +520,8 @@ class WorldMirrorPipeline:
                     edge_normal_threshold=edge_normal_threshold,
                     edge_depth_threshold=edge_depth_threshold,
                     sky_mask=sky_mask, use_gs_depth=save_gs,
+                    border_sentinel_rgb=border_sentinel_rgb,
+                    border_sentinel_tol=border_sentinel_tol,
                 )
 
             if log_time:

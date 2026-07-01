@@ -459,13 +459,59 @@ def compute_sky_mask(img_paths, H, W, S, predictions=None, source="auto",
     return sky_mask
 
 
+def _compute_border_sentinel_mask(imgs, S, H, W, sentinel_rgb, tol=0.12):
+    """Mark padded-border pixels (a sentinel fill color) as False.
+
+    ``imgs`` is the preprocessed batch tensor ``[B,S,C,H,W]`` in [0,1] RGB, so
+    the returned mask lines up 1:1 with the per-pixel filter/gs masks and with
+    the flattened per-splat order used when saving gaussians. Returns ``[S,H,W]``
+    bool where True = keep (real content), False = sentinel border pixel.
+
+    A tolerance is used because bicubic resize / JPEG bleed the exact sentinel
+    color at the content/border boundary; any pixel within ``tol`` (L-inf in
+    normalized RGB) of the sentinel is treated as border.
+    """
+    if imgs is None:
+        return None
+    x = imgs[0].detach().cpu().float()  # [S,C,H,W]
+    if x.shape[0] != S or x.shape[-2] != H or x.shape[-1] != W:
+        return None
+    target = torch.tensor(
+        [c / 255.0 for c in sentinel_rgb], dtype=x.dtype
+    ).view(1, 3, 1, 1)
+    diff = (x[:, :3] - target).abs().amax(dim=1)  # [S,H,W]
+    keep = diff > tol
+    return keep.numpy()
+
+
 def compute_filter_mask(predictions, imgs, img_paths, H, W, S,
                         apply_confidence_mask=False, apply_edge_mask=False,
                         apply_sky_mask=False, confidence_percentile=10.0,
                         edge_normal_threshold=5.0, edge_depth_threshold=0.03,
-                        sky_mask=None, use_gs_depth=False):
-    """Compute unified filter mask. Returns (filter_mask, gs_filter_mask) tuple."""
+                        sky_mask=None, use_gs_depth=False,
+                        border_sentinel_rgb=None, border_sentinel_tol=0.12):
+    """Compute unified filter mask. Returns (filter_mask, gs_filter_mask) tuple.
+
+    If ``border_sentinel_rgb`` (an (R,G,B) 0-255 tuple) is given, pixels matching
+    that sentinel fill color in the preprocessed ``imgs`` are additionally masked
+    out. This removes padded-border regions (added to center the principal point)
+    from both the point cloud and the gaussians so the model's misreading of the
+    border as scene geometry does not pollute the reconstruction.
+    """
+    border_mask = None
+    if border_sentinel_rgb is not None:
+        border_mask = _compute_border_sentinel_mask(
+            imgs, S, H, W, border_sentinel_rgb, tol=border_sentinel_tol
+        )
+        if border_mask is not None:
+            print(
+                f"[Mask] Border sentinel {tuple(border_sentinel_rgb)}: kept "
+                f"{int(border_mask.sum())}/{border_mask.size} pixels"
+            )
+
     if not (apply_confidence_mask or apply_edge_mask or apply_sky_mask):
+        if border_mask is not None:
+            return border_mask.copy(), border_mask.copy()
         return np.ones((S, H, W), dtype=bool), None
 
     if apply_sky_mask and sky_mask is None:
@@ -509,10 +555,15 @@ def compute_filter_mask(predictions, imgs, img_paths, H, W, S,
 
     if gs_depth_np is not None:
         pts_mask, gs_mask = result
+        if border_mask is not None:
+            pts_mask = pts_mask & border_mask
+            gs_mask = gs_mask & border_mask
         total = pts_mask.size
         print(f"[Mask] Filter: pts kept {pts_mask.sum()}/{total}, gs kept {gs_mask.sum()}/{total}")
         return pts_mask, gs_mask
 
+    if border_mask is not None:
+        result = result & border_mask
     print(f"[Mask] Filter: kept {result.sum()}/{result.size} points")
     return result, None
 
