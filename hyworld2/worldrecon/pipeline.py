@@ -52,6 +52,7 @@ from .hyworldmirror.utils.inference_utils import (
     load_prior_depth,
     compute_sky_mask,
     compute_filter_mask,
+    _content_rect_in_processed,
     save_results,
     print_and_save_timings,
 )
@@ -415,6 +416,7 @@ class WorldMirrorPipeline:
         edge_depth_threshold: float = 0.03,
         border_sentinel_rgb: tuple = None,
         border_sentinel_tol: float = 0.12,
+        border_pad_lrtb: tuple = None,
         # Compression
         compress_pts: bool = True,
         compress_pts_max_points: int = 2_000_000,
@@ -509,6 +511,13 @@ class WorldMirrorPipeline:
                 processed_aspect_ratio=W / H,
             ) if apply_sky_mask else None)
 
+            border_content_rect = None
+            if border_sentinel_rgb is not None and border_pad_lrtb is not None:
+                bx = compute_preprocessing_transform(img_paths, target_size)
+                border_content_rect = _content_rect_in_processed(
+                    border_pad_lrtb, bx, H, W
+                )
+
             filter_mask, gs_filter_mask = None, None
             if apply_confidence_mask or apply_edge_mask or apply_sky_mask or border_sentinel_rgb is not None:
                 filter_mask, gs_filter_mask = compute_filter_mask(
@@ -522,6 +531,7 @@ class WorldMirrorPipeline:
                     sky_mask=sky_mask, use_gs_depth=save_gs,
                     border_sentinel_rgb=border_sentinel_rgb,
                     border_sentinel_tol=border_sentinel_tol,
+                    border_content_rect=border_content_rect,
                 )
 
             if log_time:

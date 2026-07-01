@@ -459,17 +459,47 @@ def compute_sky_mask(img_paths, H, W, S, predictions=None, source="auto",
     return sky_mask
 
 
-def _compute_border_sentinel_mask(imgs, S, H, W, sentinel_rgb, tol=0.12):
+def _content_rect_in_processed(pad_lrtb, transform, H, W):
+    """Map the un-padded content rectangle into processed [H,W] coords.
+
+    ``pad_lrtb`` is (left, right, top, bottom) padding added on the ORIGINAL
+    padded canvas; ``transform`` is compute_preprocessing_transform()'s dict
+    (resize scale + center crop). Returns (x0, y0, x1, y1) integer bounds of the
+    real (non-border) content in processed pixels, clamped to [0,H]/[0,W].
+    """
+    l, r, t, b = [int(v) for v in pad_lrtb]
+    orig_w, orig_h = transform["orig_w"], transform["orig_h"]
+    sx, sy = transform["scale_x"], transform["scale_y"]
+    cx, cy = transform["crop_x"], transform["crop_y"]
+    # content box on the padded canvas -> resized -> shifted by crop origin
+    x0 = l * sx - cx
+    x1 = (orig_w - r) * sx - cx
+    y0 = t * sy - cy
+    y1 = (orig_h - b) * sy - cy
+    x0 = max(0, int(np.floor(x0))); y0 = max(0, int(np.floor(y0)))
+    x1 = min(W, int(np.ceil(x1)));  y1 = min(H, int(np.ceil(y1)))
+    return x0, y0, x1, y1
+
+
+def _compute_border_sentinel_mask(imgs, S, H, W, sentinel_rgb, tol=0.12,
+                                  content_rect=None, band=6, band_tol=0.5):
     """Mark padded-border pixels (a sentinel fill color) as False.
 
     ``imgs`` is the preprocessed batch tensor ``[B,S,C,H,W]`` in [0,1] RGB, so
     the returned mask lines up 1:1 with the per-pixel filter/gs masks and with
     the flattened per-splat order used when saving gaussians. Returns ``[S,H,W]``
-    bool where True = keep (real content), False = sentinel border pixel.
+    bool where True = keep (real content), False = border pixel.
 
-    A tolerance is used because bicubic resize / JPEG bleed the exact sentinel
-    color at the content/border boundary; any pixel within ``tol`` (L-inf in
-    normalized RGB) of the sentinel is treated as border.
+    Two complementary rules:
+      * Global color: pixels within ``tol`` (L-inf, normalized RGB) of the
+        sentinel are border. This alone is risky (a real magenta object would be
+        removed), so it is bounded by geometry below.
+      * Geometry + aggressive in-band color: when ``content_rect`` (x0,y0,x1,y1
+        in processed pixels, from the known padding) is given, everything OUTSIDE
+        the rect is border regardless of color, and INSIDE nothing is removed by
+        color EXCEPT within a ``band``-pixel margin just inside the rect edges,
+        where a much looser ``band_tol`` catches resize/JPEG bleed of the
+        sentinel. Deep interior content is never color-killed.
     """
     if imgs is None:
         return None
@@ -480,7 +510,30 @@ def _compute_border_sentinel_mask(imgs, S, H, W, sentinel_rgb, tol=0.12):
         [c / 255.0 for c in sentinel_rgb], dtype=x.dtype
     ).view(1, 3, 1, 1)
     diff = (x[:, :3] - target).abs().amax(dim=1)  # [S,H,W]
-    keep = diff > tol
+
+    if content_rect is None:
+        # Color-only fallback (previous behavior).
+        return (diff > tol).numpy()
+
+    x0, y0, x1, y1 = content_rect
+    keep = torch.zeros((S, H, W), dtype=torch.bool)
+    keep[:, y0:y1, x0:x1] = True  # inside content rect kept by default
+
+    # Aggressive sentinel removal only in a margin band just inside the edges.
+    if band > 0 and x1 > x0 and y1 > y0:
+        near_sentinel = diff <= band_tol  # loose tolerance
+        band_region = torch.zeros((H, W), dtype=torch.bool)
+        yb0, yb1 = y0, min(y1, y0 + band)
+        yb2, yb3 = max(y0, y1 - band), y1
+        xb0, xb1 = x0, min(x1, x0 + band)
+        xb2, xb3 = max(x0, x1 - band), x1
+        band_region[yb0:yb1, x0:x1] = True   # top band
+        band_region[yb2:yb3, x0:x1] = True   # bottom band
+        band_region[y0:y1, xb0:xb1] = True   # left band
+        band_region[y0:y1, xb2:xb3] = True   # right band
+        kill = near_sentinel & band_region.unsqueeze(0)
+        keep = keep & ~kill
+
     return keep.numpy()
 
 
@@ -489,24 +542,28 @@ def compute_filter_mask(predictions, imgs, img_paths, H, W, S,
                         apply_sky_mask=False, confidence_percentile=10.0,
                         edge_normal_threshold=5.0, edge_depth_threshold=0.03,
                         sky_mask=None, use_gs_depth=False,
-                        border_sentinel_rgb=None, border_sentinel_tol=0.12):
+                        border_sentinel_rgb=None, border_sentinel_tol=0.12,
+                        border_content_rect=None):
     """Compute unified filter mask. Returns (filter_mask, gs_filter_mask) tuple.
 
-    If ``border_sentinel_rgb`` (an (R,G,B) 0-255 tuple) is given, pixels matching
-    that sentinel fill color in the preprocessed ``imgs`` are additionally masked
-    out. This removes padded-border regions (added to center the principal point)
-    from both the point cloud and the gaussians so the model's misreading of the
-    border as scene geometry does not pollute the reconstruction.
+    If ``border_sentinel_rgb`` (an (R,G,B) 0-255 tuple) is given, padded-border
+    pixels are additionally masked out of both the point cloud and the gaussians
+    so the model's misreading of the border as scene geometry does not pollute
+    the reconstruction. When ``border_content_rect`` (x0,y0,x1,y1 in processed
+    pixels) is also given, the known padding geometry bounds the removal so real
+    scene content can never be dropped by color alone.
     """
     border_mask = None
     if border_sentinel_rgb is not None:
         border_mask = _compute_border_sentinel_mask(
-            imgs, S, H, W, border_sentinel_rgb, tol=border_sentinel_tol
+            imgs, S, H, W, border_sentinel_rgb, tol=border_sentinel_tol,
+            content_rect=border_content_rect,
         )
         if border_mask is not None:
+            mode = "geom+color" if border_content_rect is not None else "color"
             print(
-                f"[Mask] Border sentinel {tuple(border_sentinel_rgb)}: kept "
-                f"{int(border_mask.sum())}/{border_mask.size} pixels"
+                f"[Mask] Border sentinel {tuple(border_sentinel_rgb)} ({mode}): "
+                f"kept {int(border_mask.sum())}/{border_mask.size} pixels"
             )
 
     if not (apply_confidence_mask or apply_edge_mask or apply_sky_mask):
